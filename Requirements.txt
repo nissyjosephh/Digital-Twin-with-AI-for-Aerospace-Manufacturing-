@@ -1,0 +1,9 @@
+Packages to install on a new machine:
+simpy
+numpy
+scipy
+pandas
+supabase
+python-dotenv
+plotly
+streamlit
