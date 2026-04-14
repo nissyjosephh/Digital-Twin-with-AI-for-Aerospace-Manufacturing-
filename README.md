@@ -1,13 +1,13 @@
 # Smart Digital Twin with AI-Enhanced Defect Detection for Aerospace Manufacturing
 
-BSc Computer Science Final Year Project — Birmingham City University
+BSc. (Hons.) Computer Science Final Year Project 
+Birmingham City University
 
 Author: Nissy Joseph (22177041)
 Supervisor: Debashish Das
 Industry Partners: Safran - Scott Dickin, Rhys Woodward
 
 ## What This Project Does
-
 A prototype digital twin of a 5-axis CNC machining process for Ti-6Al-4V
 aerospace components, with AI-based defect detection using Random Forest
 (parameter prediction) and YOLOv11 OBB (visual inspection).
