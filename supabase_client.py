@@ -250,6 +250,7 @@ class DigitalTwinDB:
                 "material_utilisation_pct"
             ),
             "scrap_weight_kg": metrics.get("scrap_weight_kg"),
+            "coolant_litres_used": metrics.get("coolant_litres_used"),
             "chip_to_part_ratio": metrics.get("chip_to_part_ratio"),
         }
 
