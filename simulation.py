@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timedelta
 
 from config import (
-    RANDOM_SEED, SIM_DURATION_MINS, SENSOR_INTERVAL,
+    RANDOM_SEED, SIM_DURATION_MINS, SENSOR_INTERVAL,   """ these are unused imports """
     NUM_PARTS, OPERATIONS, MACHINE_CONFIG,
     TOOL_WEAR_CONFIG, MachineState,
 )
