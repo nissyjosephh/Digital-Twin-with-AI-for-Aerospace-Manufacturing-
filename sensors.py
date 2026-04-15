@@ -31,8 +31,8 @@ class SensorGenerator:
         Initialise with fixed seed for reproducibility.
 
         The Cholesky decomposition of the correlation matrix is computed
-        ONCE here (not every reading) — this is an optimisation you can
-        mention in your implementation chapter.
+        ONCE here (not every reading) — this is an optimisation to 
+        mention in the implementation chapter.
         """
         # Dedicated RNG — doesn't affect global numpy random state
         self.rng = np.random.default_rng(seed)
@@ -47,6 +47,7 @@ class SensorGenerator:
         self.current_tool_wear_vb = TOOL_WEAR_CONFIG["initial_vb"]
         self.cumulative_cutting_minutes = 0.0
         self.cumulative_energy_kwh = 0.0
+        self.cumulative_coolant_litres = 0.0
 
         # Anomalies persist across readings until resolved
         self.active_anomalies = {
@@ -159,6 +160,7 @@ class SensorGenerator:
 
         # ── STEP 5: Update energy accumulator ────────────────────────
         self.cumulative_energy_kwh += power / 60.0  # kW * (1/60 hr)
+        self.cumulative_coolant_litres += coolant_flow / 60.0  # L/min to L per minute interval
 
         # ── STEP 6: Defect probability (sigmoid) ────────────────────
         defect_prob = self._calc_defect_probability(
@@ -294,6 +296,7 @@ class SensorGenerator:
                 e_per_part * cs["uk_grid_co2_kg_per_kwh"], 4
             ),
             "material_utilisation_pct": round(mat_util, 1),
+            "coolant_litres_used": round(self.cumulative_coolant_litres, 2),
             "scrap_weight_kg": round(total_scrap, 2),
             "chip_to_part_ratio": round(
                 scrap_per / cw["final_weight_kg"], 2
