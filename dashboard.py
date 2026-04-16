@@ -209,11 +209,6 @@ def build_full_run_comparison(all_runs: pd.DataFrame) -> pd.DataFrame:
 # SIDEBAR — RUN SELECTOR (shared across tabs)
 # =====================================================================
 
-st.sidebar.image(
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/4/49/"
-    "Safran_-_logo_2016.png/320px-Safran_-_logo_2016.png",
-    width=200,
-)
 st.sidebar.title("Digital Twin Dashboard")
 st.sidebar.markdown("**Smart Manufacturing for Aerospace**")
 st.sidebar.markdown("---")
@@ -300,9 +295,13 @@ with tab1:
             )
 
         with col2:
+            max_cutting_defect = sensor_df[
+                sensor_df["machine_state"] == "machining"
+            ]["defect_probability"].max()
             st.metric(
-                "Defect Probability",
-                f"{latest['defect_probability'] * 100:.1f}%"
+                "Peak Defect Risk",
+                f"{max_cutting_defect * 100:.1f}%",
+                help="Maximum defect probability during cutting operations",
             )
 
         with col3:
@@ -317,6 +316,71 @@ with tab1:
             st.metric(
                 "Cumulative Energy",
                 f"{latest['cumulative_energy_kwh']:.1f} kWh"
+            )
+
+        st.markdown("---")
+
+        # ── Alert Banner ──────────────────────────────────────────────
+        max_defect = sensor_df[sensor_df["machine_state"] == "machining"]["defect_probability"].max()
+        max_wear = sensor_df["tool_wear_vb_mm"].max()
+        
+        if selected_run["defective_parts"] > 0:
+            st.error(
+                f"PRODUCTION ALERT: {selected_run['defective_parts']} of "
+                f"{selected_run['total_parts']} parts failed quality checks. "
+                f"Maximum tool wear reached {max_wear:.3f}mm "
+                f"(ISO 3685 limit: 0.30mm). "
+                f"Peak defect probability: {max_defect*100:.1f}%."
+            )
+        elif max_wear > 0.20:
+            st.warning(
+                f"Tool wear reached {max_wear:.3f}mm. Consider lowering "
+                f"tool change threshold to prevent future defects."
+            )
+        else:
+            st.success(
+                f"All {selected_run['total_parts']} parts passed quality checks. "
+                f"Maximum tool wear: {max_wear:.3f}mm (within normal range)."
+            )
+
+        st.markdown("---")
+
+        # ── Operation Defect Analysis ─────────────────────────────────
+        st.subheader("Operation Defect Analysis")
+        st.caption("Maximum defect probability per operation per part. Red indicates critical risk.")
+        
+        cutting_df = sensor_df[sensor_df["machine_state"] == "machining"].copy()
+        if not cutting_df.empty:
+            op_defect = (
+                cutting_df.groupby(["part_number", "operation"])
+                .agg(
+                    max_defect_prob=("defect_probability", "max"),
+                    max_tool_wear=("tool_wear_vb_mm", "max"),
+                    avg_vibration=("vibration_rms", "mean"),
+                )
+                .reset_index()
+            )
+            op_defect["risk_level"] = op_defect["max_defect_prob"].apply(
+                lambda x: "CRITICAL" if x >= 0.7 else ("WARNING" if x >= 0.3 else "NORMAL")
+            )
+            op_defect.columns = [
+                "Part", "Operation", "Max Defect Prob", "Max Tool Wear (mm)",
+                "Avg Vibration (mm/s)", "Risk Level",
+            ]
+            op_defect["Max Defect Prob"] = (op_defect["Max Defect Prob"] * 100).round(1).astype(str) + "%"
+            op_defect["Max Tool Wear (mm)"] = op_defect["Max Tool Wear (mm)"].round(3)
+            op_defect["Avg Vibration (mm/s)"] = op_defect["Avg Vibration (mm/s)"].round(2)
+            
+            st.dataframe(
+                op_defect.style.apply(
+                    lambda row: [
+                        "background-color: rgba(239, 68, 68, 0.2)" if row["Risk Level"] == "CRITICAL"
+                        else "background-color: rgba(245, 158, 11, 0.2)" if row["Risk Level"] == "WARNING"
+                        else "" for _ in row
+                    ], axis=1
+                ),
+                use_container_width=True,
+                hide_index=True,
             )
 
         st.markdown("---")
@@ -457,7 +521,51 @@ with tab1:
                     use_container_width=True,
                     hide_index=True,
                 )
-
+        # ── Closed-Loop Decision Support ─────────────────────────────
+        st.markdown("---")
+        st.subheader("Decision Support Recommendations")
+        
+        recommendations = []
+        
+        if max_wear > 0.30:
+            recommendations.append(
+                f"**Tool Change Required:** Final tool wear ({max_wear:.3f}mm) exceeded "
+                f"ISO 3685 limit (0.30mm). Set tool_change_threshold to 0.20mm to trigger "
+                f"automatic replacement before quality degrades. Estimated scrap savings: "
+                f"£{selected_run['defective_parts'] * 12.5 * 35:.0f} per shift."
+            )
+        
+        avg_temp = sensor_df[sensor_df["machine_state"] == "machining"]["temperature_c"].mean()
+        if avg_temp > 55:
+            recommendations.append(
+                f"**Thermal Management:** Average cutting temperature ({avg_temp:.1f} C) exceeds "
+                f"normal threshold (55 C). Consider reducing spindle RPM by 10% during rough "
+                f"milling or increasing coolant flow rate to 35 L/min."
+            )
+        
+        avg_vib = sensor_df[sensor_df["machine_state"] == "machining"]["vibration_rms"].mean()
+        if avg_vib > 2.0:
+            recommendations.append(
+                f"**Vibration Control:** Average vibration ({avg_vib:.2f} mm/s) is elevated. "
+                f"Reduce feed rate by 10% during rough milling to lower cutting forces "
+                f"and extend tool life."
+            )
+        
+        coolant_drops = sensor_df[sensor_df["coolant_flow_lmin"] < 10]
+        if len(coolant_drops) > 0:
+            recommendations.append(
+                f"**Coolant System Check:** {len(coolant_drops)} readings showed coolant flow "
+                f"below 10 L/min. Inspect coolant filter and pump pressure. Low coolant "
+                f"increases defect probability by 2.5x."
+            )
+        
+        if not recommendations:
+            st.success(
+                "No immediate actions required. All parameters within acceptable ranges."
+            )
+        else:
+            for rec in recommendations:
+                st.warning(rec)
 
 # =====================================================================
 # TAB 2: AI DEFECT PREDICTIONS (placeholder for now)
