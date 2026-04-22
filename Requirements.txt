@@ -6,3 +6,6 @@ supabase
 python-dotenv
 plotly
 streamlit
+ultralytics
+opencv-python-headless
+Pillow

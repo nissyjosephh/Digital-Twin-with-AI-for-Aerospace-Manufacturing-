@@ -8,21 +8,29 @@ When you call env.run(), SimPy executes all generator processes in
 simulated time order — a 4-hour production shift completes in milliseconds
 of real time.
 
+YOLO Integration: At each CMM Inspection checkpoint, the simulation
+triggers the YOLOv11s-OBB model to run visual defect detection on a
+sample aircraft image. This simulates what a camera-based inspection
+system would do at the end of each machining cycle. Results are stored
+in the visual_inspections table in Supabase.
+ 
 Author: Nissy Joseph
 """
 
 import simpy
 import pandas as pd
 import os
+import json
 from datetime import datetime, timedelta
 
 from config import (
-    RANDOM_SEED, SIM_DURATION_MINS, SENSOR_INTERVAL,   """ these are unused imports """
+    RANDOM_SEED, SIM_DURATION_MINS, SENSOR_INTERVAL,  
     NUM_PARTS, OPERATIONS, MACHINE_CONFIG,
     TOOL_WEAR_CONFIG, MachineState,
 )
 from sensors import SensorGenerator
 from supabase_client import DigitalTwinDB
+from ai_model import VisualInspector
 
 class CNCDigitalTwin:
     """
@@ -61,6 +69,7 @@ class CNCDigitalTwin:
         # Data collection — list of dicts, converted to DataFrame at end
         self.sensor_data = []
         self.event_log = []
+        self.inspection_results = []  # stores YOLO inspection results
 
         # Production tracking
         self.parts_produced = 0
@@ -74,11 +83,20 @@ class CNCDigitalTwin:
         try:
             self.db = DigitalTwinDB()
             self.db_connected = True
-            print("  Database: Connected to Supabase")
+            print("Database: Connected to Supabase")
         except Exception as e:
             self.db = None
             self.db_connected = False
-            print(f"  Database: Running in CSV-only mode ({e})")
+            print(f"Database: Running in CSV-only mode ({e})")
+
+         # YOLO Visual Inspector — loads the trained model once at startup
+        # The model file (best.pt) must be in the project root directory
+        # Test images must be in the test_images/ directory
+        self.inspector = VisualInspector(
+            model_path="best.pt",
+            test_images_dir="test_images",
+            conf_threshold=0.25,
+        )
 
     def run(self):
         """
@@ -157,7 +175,7 @@ class CNCDigitalTwin:
         for part_num in range(1, NUM_PARTS + 1):
             print(f"\n--- PART {part_num}/{NUM_PARTS} ---")
 
-            # Check if tool needs changing BEFORE starting new part
+            # Check if tool needs changing before starting new part
             if (self.sensor_gen.current_tool_wear_vb >=
                     TOOL_WEAR_CONFIG["tool_change_threshold_vb"]):
                 yield from self._tool_change(part_num)
@@ -169,11 +187,18 @@ class CNCDigitalTwin:
                 with self.machine.request() as req:
                     yield req  # Wait until machine is available
 
-                    # Execute the operation
-                    defect_detected = yield from self._execute_operation(
-                        operation, part_num
-                    )
-
+                    # Check if this is the inspection operation
+                    if operation["name"] == "inspection":
+                        # Run YOLO visual inspection at CMM checkpoint
+                        defect_detected = yield from self._execute_inspection(
+                            operation, part_num
+                        )
+                    else:
+                        # Normal machining operation
+                        defect_detected = yield from self._execute_operation(
+                            operation, part_num
+                        )
+ 
                     if defect_detected:
                         part_defective = True
 
@@ -297,6 +322,133 @@ class CNCDigitalTwin:
 
         return defect_detected
 
+    def _execute_inspection(self, operation, part_num):
+        """
+        Execute CMM inspection with YOLO visual defect detection.
+ 
+        This method runs during the 'inspection' operation in the
+        machining sequence. It:
+        1. Generates sensor readings for the inspection duration
+           (probe measurements, no cutting)
+        2. Triggers YOLOv11s-OBB inference on a sample image
+        3. Stores the visual inspection results in Supabase
+        4. Returns whether a defect was detected
+ 
+        In a real factory, the CMM probe checks dimensions while
+        a camera inspects the surface. Our simulation models both:
+        - Dimensional check: via the sensor readings and defect probability
+        - Visual check: via YOLO inference on aircraft defect images
+ 
+        Args:
+            operation: The inspection operation dict from OPERATIONS
+            part_num: Current part number
+ 
+        Yields:
+            SimPy timeout events
+ 
+        Returns:
+            bool: True if defect detected (by sensor OR vision)
+        """
+        op_name = operation["display_name"]
+        duration = operation["duration_minutes"]
+        sensor_defect = False
+ 
+        self._set_state(MachineState.IDLE)
+        self._log_event(
+            "INSPECTION_START",
+            f"Part {part_num}: CMM Inspection + Visual AI started"
+        )
+ 
+        print(f"  {op_name}: ", end="", flush=True)
+ 
+        # Generate sensor readings for inspection duration
+        # (probe measurements, temperature stabilisation, etc.)
+        for minute in range(duration):
+            reading = self.sensor_gen.generate_reading(
+                operation, elapsed_minutes_in_op=minute
+            )
+            reading["part_number"] = part_num
+            reading["sim_time_minutes"] = round(self.env.now, 2)
+            reading["real_timestamp"] = (
+                self.sim_start_time
+                + timedelta(minutes=self.env.now)
+            ).isoformat()
+ 
+            self.sensor_data.append(reading)
+ 
+            if self.db_connected:
+                self.db.store_sensor_reading(reading)
+ 
+            print(".", end="", flush=True)
+ 
+            if reading["defect_probability"] >= 0.5:
+                sensor_defect = True
+ 
+            yield self.env.timeout(1)
+ 
+        print(f" [{duration}min]")
+ 
+        # ── YOLO Visual Inspection ────────────────────────────────
+        # Run the trained YOLOv11s-OBB model on a sample image.
+        # This simulates what a camera-based inspection system
+        # would do at the end of the machining cycle.
+        vision_defect = False
+ 
+        if self.inspector.is_available():
+            inspection = self.inspector.run_inspection(
+                part_number=part_num,
+                tool_wear_vb=self.sensor_gen.current_tool_wear_vb,
+            )
+ 
+            # Store inspection results locally
+            self.inspection_results.append(inspection)
+ 
+            # Store in Supabase
+            if self.db_connected:
+                # Convert detections to JSON-serialisable format
+                db_inspection = {
+                    "image_url": inspection["image_url"],
+                    "annotated_image_url": inspection["annotated_image_url"],
+                    "detections": json.dumps(inspection["detections"]),
+                    "total_defects": inspection["total_defects"],
+                    "defect_classes": inspection["defect_classes"],
+                    "avg_confidence": inspection["avg_confidence"],
+                    "pass_fail": inspection["pass_fail"],
+                }
+                self.db.store_visual_inspection(db_inspection)
+ 
+            # Vision-based defect detection
+            if not inspection["pass_fail"]:
+                vision_defect = True
+                self._log_event(
+                    "VISUAL_DEFECT_DETECTED",
+                    f"Part {part_num}: YOLO detected {inspection['total_defects']} "
+                    f"defect(s) — {', '.join(inspection['defect_classes'])}. "
+                    f"Critical: {', '.join(inspection['critical_defects_found']) or 'None'}"
+                )
+            else:
+                defect_msg = (
+                    "No defects" if inspection["total_defects"] == 0
+                    else f"{inspection['total_defects']} non-critical defect(s)"
+                )
+                self._log_event(
+                    "VISUAL_INSPECTION_PASS",
+                    f"Part {part_num}: YOLO — {defect_msg}"
+                )
+        else:
+            self._log_event(
+                "INSPECTION_END",
+                f"Part {part_num}: CMM Inspection completed (YOLO unavailable)"
+            )
+ 
+        self._log_event(
+            "INSPECTION_END",
+            f"Part {part_num}: CMM Inspection completed"
+        )
+ 
+        # Defect detected if EITHER sensor analysis OR vision detects one
+        return sensor_defect or vision_defect
+
     def _tool_change(self, part_num):
         """
         Perform an automatic tool change.
@@ -356,6 +508,23 @@ class CNCDigitalTwin:
         print(f"  Tool changes:     {self.tool_changes}")
         print(f"  Total readings:   {len(sensor_df)}")
         print(f"  Sim duration:     {sensor_df['sim_time_minutes'].max():.0f} minutes")
+        
+        # YOLO inspection summary
+        if self.inspection_results:
+            total_inspections = len(self.inspection_results)
+            total_defects_found = sum(
+                r["total_defects"] for r in self.inspection_results
+            )
+            failed_inspections = sum(
+                1 for r in self.inspection_results if not r["pass_fail"]
+            )
+            print(f"\n  --- Visual Inspection (YOLOv11s-OBB) ---")
+            print(f"  Inspections run:  {total_inspections}")
+            print(f"  Total defects:    {total_defects_found}")
+            print(f"  Parts failed:     {failed_inspections}")
+            print(f"  Visual yield:     "
+                  f"{((total_inspections - failed_inspections) / max(1, total_inspections)) * 100:.1f}%")
+ 
         print(f"\n  --- Sustainability ---")
         print(f"  Energy total:     {sustainability['energy_kwh_total']:.1f} kWh")
         print(f"  Energy/part:      {sustainability['energy_kwh_per_part']:.1f} kWh")

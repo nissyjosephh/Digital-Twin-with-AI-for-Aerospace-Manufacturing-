@@ -8,17 +8,19 @@ predictions, sustainability metrics, and experiment comparisons.
 Run with: streamlit run dashboard.py
 Opens at: http://localhost:8501
 
-Author: Nissy Joseph | Birmingham City University
+Nissy Joseph | Birmingham City University
 """
 
 import os
 import streamlit as st
 import pandas as pd
+import json
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from PIL import Image
 
 # Load Supabase credentials from .env
 load_dotenv()
@@ -36,7 +38,7 @@ st.set_page_config(
 
 
 # =====================================================================
-# DATABASE CONNECTION (cached so we don't reconnect on every interaction)
+# DATABASE CONNECTION
 # =====================================================================
 
 @st.cache_resource
@@ -53,6 +55,23 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
+# =====================================================================
+# YOLO MODEL LOADING (cached so it loads once)
+# =====================================================================
+ 
+@st.cache_resource
+def load_yolo_model():
+    """Load the YOLO model once for the dashboard's upload feature."""
+    try:
+        from ai_model import VisualInspector
+        inspector = VisualInspector(
+            model_path="best.pt",
+            test_images_dir="test_images",
+            conf_threshold=0.25,
+        )
+        return inspector if inspector.model is not None else None
+    except Exception as e:
+        return None
 
 # =====================================================================
 # DATA FETCHING FUNCTIONS (cached for 30 seconds)
@@ -85,6 +104,17 @@ def fetch_sensor_readings(run_id):
     )
     return pd.DataFrame(response.data)
 
+@st.cache_data(ttl=30)
+def fetch_visual_inspections(run_id):
+    """Fetch YOLO visual inspection results for a production run."""
+    response = (
+        supabase.table("visual_inspections")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("timestamp")
+        .execute()
+    )
+    return pd.DataFrame(response.data)
 
 @st.cache_data(ttl=30)
 def fetch_sustainability_metrics(run_id=None):
@@ -568,35 +598,233 @@ with tab1:
                 st.warning(rec)
 
 # =====================================================================
-# TAB 2: AI DEFECT PREDICTIONS (placeholder for now)
+# TAB 2: AI VISUAL INSPECTION (YOLOv11s-OBB)
 # =====================================================================
-
+ 
 with tab2:
-    st.header("AI Defect Predictions")
+    st.header("AI Visual Inspection")
     st.caption(
-        "Random Forest parameter-based predictions and YOLOv11 visual inspection results."
+        "YOLOv11s-OBB visual defect detection results from CMM inspection checkpoints. "
+        "The model detects 22 types of aircraft structural defects using oriented bounding boxes."
     )
-
-    st.info(
-        "This tab will be implemented after Random Forest and YOLOv11 "
-        "are integrated into the simulation pipeline. Currently, the analytical "
-        "sigmoid-based defect probability is shown in Tab 1."
+ 
+    # ── Section 1: Inspection Results from Simulation ─────────────
+    st.subheader("Simulation Inspection Results")
+ 
+    inspections_df = fetch_visual_inspections(selected_run_id)
+ 
+    if inspections_df.empty:
+        st.info(
+            "No visual inspection data for this run. "
+            "Run the simulation with best.pt and test_images/ to generate results."
+        )
+    else:
+        # KPI Row
+        total_inspections = len(inspections_df)
+        total_defects = inspections_df["total_defects"].sum()
+        failed_parts = len(inspections_df[inspections_df["pass_fail"] == False])
+        avg_conf = inspections_df[inspections_df["avg_confidence"] > 0]["avg_confidence"].mean()
+ 
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Parts Inspected", total_inspections)
+        with col2:
+            st.metric("Total Defects Found", int(total_defects))
+        with col3:
+            st.metric("Parts Failed", failed_parts)
+        with col4:
+            st.metric("Avg Confidence",
+                       f"{avg_conf:.1%}" if pd.notna(avg_conf) else "N/A")
+ 
+        st.markdown("---")
+ 
+        # Per-part inspection results
+        for idx, row in inspections_df.iterrows():
+            pass_fail_str = "PASS" if row["pass_fail"] else "FAIL"
+            status_color = "green" if row["pass_fail"] else "red"
+ 
+            with st.expander(
+                f"Part Inspection — {pass_fail_str} | "
+                f"{row['total_defects']} defect(s) detected",
+                expanded=(not row["pass_fail"])  # Auto-expand failed parts
+            ):
+                col_img, col_details = st.columns([1, 1])
+ 
+                with col_img:
+                    # Display annotated image if it exists locally
+                    annotated_path = row.get("annotated_image_url", "")
+                    if annotated_path and os.path.exists(annotated_path):
+                        st.image(annotated_path, caption="Annotated Detection Image",
+                                 use_container_width=True)
+                    else:
+                        st.info("Annotated image not available locally.")
+ 
+                with col_details:
+                    st.markdown(f"**Result:** :{status_color}[{pass_fail_str}]")
+                    st.markdown(f"**Defects Found:** {row['total_defects']}")
+ 
+                    if row["defect_classes"]:
+                        classes = row["defect_classes"]
+                        if isinstance(classes, str):
+                            try:
+                                classes = json.loads(classes)
+                            except:
+                                classes = [classes]
+                        st.markdown(f"**Defect Types:** {', '.join(classes)}")
+ 
+                    if row["avg_confidence"] and row["avg_confidence"] > 0:
+                        st.markdown(f"**Avg Confidence:** {row['avg_confidence']:.1%}")
+ 
+                    st.markdown(f"**Source Image:** {row.get('image_url', 'N/A')}")
+ 
+                    # Show individual detections table
+                    if row.get("detections"):
+                        detections = row["detections"]
+                        if isinstance(detections, str):
+                            try:
+                                detections = json.loads(detections)
+                            except:
+                                detections = []
+ 
+                        if detections:
+                            det_df = pd.DataFrame(detections)
+                            if "class_name" in det_df.columns and "confidence" in det_df.columns:
+                                display_det = det_df[["class_name", "confidence"]].copy()
+                                display_det.columns = ["Defect Class", "Confidence"]
+                                display_det["Confidence"] = (
+                                    display_det["Confidence"] * 100
+                                ).round(1).astype(str) + "%"
+                                st.dataframe(display_det, use_container_width=True,
+                                             hide_index=True)
+ 
+        st.markdown("---")
+ 
+        # Defect class distribution across all inspections
+        st.subheader("Defect Class Distribution")
+ 
+        all_classes = []
+        for _, row in inspections_df.iterrows():
+            classes = row.get("defect_classes", [])
+            if isinstance(classes, str):
+                try:
+                    classes = json.loads(classes)
+                except:
+                    classes = [classes] if classes else []
+            all_classes.extend(classes)
+ 
+        if all_classes:
+            class_counts = pd.Series(all_classes).value_counts().reset_index()
+            class_counts.columns = ["Defect Class", "Count"]
+ 
+            fig_classes = px.bar(
+                class_counts, x="Count", y="Defect Class",
+                orientation="h", title="Detected Defect Types Across All Parts",
+                color="Count", color_continuous_scale="Reds",
+            )
+            fig_classes.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig_classes, use_container_width=True)
+ 
+    # ── Section 2: Upload Image for Instant Inspection ────────────
+    st.markdown("---")
+    st.subheader("Upload Image for Inspection")
+    st.caption(
+        "Upload a photo of an aircraft component for instant AI defect detection. "
+        "The YOLOv11s-OBB model analyses the image and highlights any defects found."
     )
-
-    st.markdown("### What this tab will show:")
-    st.markdown("""
-    **Random Forest Predictions:**
-    - Comparison chart: analytical sigmoid vs ML prediction over time
-    - Feature importance bar chart showing which sensors most influenced predictions
-    - Alert history table with timestamps and recommended actions
-    - Decision support panel with actionable insights
-
-    **YOLOv11 Visual Inspection:**
-    - Original and annotated inspection images side by side
-    - Detected defect classes with bounding boxes and confidence scores
-    - Pass/fail decisions per part
-    - Most common defect types across all runs
-    """)
+ 
+    uploaded_file = st.file_uploader(
+        "Choose an aircraft part image",
+        type=["jpg", "jpeg", "png"],
+        help="Upload a photo of an aircraft component surface for defect analysis."
+    )
+ 
+    if uploaded_file is not None:
+        # Save uploaded file temporarily
+        temp_dir = os.path.join("data", "uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, uploaded_file.name)
+ 
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+ 
+        # Load YOLO model and run inference
+        inspector = load_yolo_model()
+ 
+        if inspector is not None:
+            with st.spinner("Running YOLOv11s-OBB inference..."):
+                result = inspector.run_single_image(temp_path)
+ 
+            # Display results
+            col_orig, col_anno = st.columns(2)
+ 
+            with col_orig:
+                st.markdown("**Original Image**")
+                st.image(temp_path, use_container_width=True)
+ 
+            with col_anno:
+                st.markdown("**Detected Defects**")
+                if result["annotated_image_url"] and os.path.exists(result["annotated_image_url"]):
+                    st.image(result["annotated_image_url"], use_container_width=True)
+                else:
+                    st.info("No annotated image generated.")
+ 
+            # Results summary
+            pass_fail = "PASS" if result["pass_fail"] else "FAIL"
+            status_color = "green" if result["pass_fail"] else "red"
+ 
+            st.markdown(f"### Result: :{status_color}[{pass_fail}]")
+ 
+            res_col1, res_col2, res_col3 = st.columns(3)
+            with res_col1:
+                st.metric("Defects Found", result["total_defects"])
+            with res_col2:
+                st.metric("Avg Confidence",
+                           f"{result['avg_confidence']:.1%}" if result["avg_confidence"] > 0 else "N/A")
+            with res_col3:
+                if result["critical_defects_found"]:
+                    st.error(f"Critical: {', '.join(result['critical_defects_found'])}")
+                else:
+                    st.success("No critical defects")
+ 
+            # Detection details table
+            if result["detections"]:
+                det_df = pd.DataFrame(result["detections"])
+                if "class_name" in det_df.columns:
+                    display_det = det_df[["class_name", "confidence"]].copy()
+                    display_det.columns = ["Defect Class", "Confidence"]
+                    display_det["Confidence"] = (display_det["Confidence"] * 100).round(1).astype(str) + "%"
+                    display_det = display_det.sort_values("Confidence", ascending=False)
+                    st.dataframe(display_det, use_container_width=True, hide_index=True)
+        else:
+            st.error(
+                "Model is not available. Ensure best.pt is in the project directory."
+            )
+ 
+    # ── Section 3: Model Information ──────────────────────────────
+    st.markdown("---")
+    st.subheader("Model Information")
+ 
+    info_col1, info_col2 = st.columns(2)
+    with info_col1:
+        st.markdown("""
+        **YOLOv11s-OBB (Oriented Bounding Box)**
+        - Architecture: CNN (C3k2 + C2PSA + SPPF)
+        - Parameters: 9.7M
+        - Training: 50 epochs on 18,555 images
+        - Task: Oriented object detection (OBB)
+        - Inference: ~15ms/image (GPU) | ~150ms/image (CPU)
+        """)
+    with info_col2:
+        st.markdown("""
+        **22 Aerospace Defect Classes:**
+ 
+        broken_discharge, broken_link, burn_damage, corrosion_damage,
+        crack, dent, dirty_surface, distortion, light_damage,
+        loosened_fastener, missing_fastener, missing_label, missing_light,
+        missing_panel, nick, oil_leakage, open_latch, paint_damage,
+        scratch, unpressurized_tire, worn_tire, wrong_fastener
+        """)
+ 
 
 
 # =====================================================================
