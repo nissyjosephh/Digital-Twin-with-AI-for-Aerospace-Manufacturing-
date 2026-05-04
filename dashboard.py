@@ -24,7 +24,124 @@ from PIL import Image
 
 # Load Supabase credentials from .env
 load_dotenv()
+_supabase_url = os.environ.get("SUPABASE_URL")
+_supabase_key = os.environ.get("SUPABASE_KEY")
+supabase_client_temp = create_client(_supabase_url, _supabase_key)
+# =====================================================================
+# AUTHENTICATION — Must come before page config
+# =====================================================================
 
+def check_authentication():
+    """
+    Check if user is logged in via Supabase Auth.
+    Returns True if authenticated, False if not.
+    Session state keys used:
+    - authenticated: bool
+    - user_email: str
+    - user_role: str (operator or manager)
+    - user_name: str
+    """
+    return st.session_state.get("authenticated", False)
+
+
+def get_user_role(email):
+    """
+    Look up the user's role from the user_roles table.
+    Called after successful Supabase Auth login.
+    """
+    try:
+        response = (
+            supabase_client_temp.table("user_roles")
+            .select("role, full_name")
+            .eq("email", email)
+            .execute()
+        )
+        if response.data:
+            return response.data[0]["role"], response.data[0]["full_name"]
+        return "operator", email  # default to operator if not found
+    except Exception:
+        return "operator", email
+
+
+def show_login_page():
+    """
+    Render the login page. Replaces the entire dashboard
+    until the user authenticates successfully.
+    """
+    # Centre the login form
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown("---")
+        st.image(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9f/Safran_logo.svg/320px-Safran_logo.svg.png",
+            width=160,
+        )
+        st.markdown("## Aerospace Manufacturing Digital Twin")
+        st.markdown("#### Smart Quality Assurance Platform")
+        st.markdown("---")
+
+        st.markdown("### Sign In")
+        st.caption("Enter your credentials to access the dashboard.")
+
+        with st.form("login_form"):
+            email = st.text_input(
+                "Email Address",
+                placeholder="you@aerospace.com",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Enter your password",
+            )
+            submit = st.form_submit_button(
+                "Sign In",
+                use_container_width=True,
+            )
+
+        if submit:
+            if not email or not password:
+                st.error("Please enter both email and password.")
+                return
+
+            with st.spinner("Authenticating..."):
+                try:
+                    # Attempt Supabase Auth login
+                    auth_response = supabase_client_temp.auth.sign_in_with_password({
+                        "email": email,
+                        "password": password,
+                    })
+
+                    if auth_response.user:
+                        # Get role from user_roles table
+                        role, full_name = get_user_role(email)
+
+                        # Store in session state
+                        st.session_state.authenticated = True
+                        st.session_state.user_email = email
+                        st.session_state.user_role = role
+                        st.session_state.user_name = full_name
+
+                        st.success(f"Welcome, {full_name}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password. Please try again.")
+
+                except Exception as e:
+                    error_msg = str(e)
+                    if "Invalid login credentials" in error_msg:
+                        st.error("Invalid email or password. Please try again.")
+                    elif "Email not confirmed" in error_msg:
+                        st.error("Please confirm your email address before logging in.")
+                    else:
+                        st.error(f"Login failed. Please try again.")
+
+        st.markdown("---")
+        st.caption("🔒 Secured by Supabase Authentication")
+        st.caption(
+            "Smart Digital Twin with AI-Enhanced Defect Detection | "
+            "Birmingham City University | Nissy Joseph"
+        )
 
 # =====================================================================
 # PAGE CONFIGURATION (must be first Streamlit command)
@@ -36,6 +153,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── AUTHENTICATION GATE ───────────────────────────────────────────────
+if not check_authentication():
+    show_login_page()
+    st.stop()
 
 # =====================================================================
 # DATABASE CONNECTION
@@ -125,6 +246,16 @@ def fetch_sustainability_metrics(run_id=None):
     response = query.execute()
     return pd.DataFrame(response.data)
 
+@st.cache_data(ttl=30)
+def fetch_defect_predictions(run_id):
+    """Fetch RF defect predictions for a production run."""
+    response = (
+        supabase.table("defect_predictions")
+        .select("*")
+        .eq("run_id", run_id)
+        .execute()
+    )
+    return pd.DataFrame(response.data)
 
 @st.cache_data(ttl=30)
 def fetch_all_runs_with_metrics():
@@ -243,6 +374,24 @@ st.sidebar.title("Digital Twin Dashboard")
 st.sidebar.markdown("**Smart Manufacturing for Aerospace**")
 st.sidebar.markdown("---")
 
+# ── USER INFO + LOGOUT ────────────────────────────────────────────────
+user_role = st.session_state.get("user_role", "operator")
+user_name = st.session_state.get("user_name", "User")
+user_email = st.session_state.get("user_email", "")
+
+role_badge = "🔧 Operator" if user_role == "operator" else "👔 Production Manager"
+st.sidebar.markdown(f"**{user_name}**")
+st.sidebar.caption(f"{role_badge}")
+st.sidebar.caption(f"{user_email}")
+
+if st.sidebar.button("Sign Out", use_container_width=True):
+    for key in ["authenticated", "user_email", "user_role", "user_name"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+
+st.sidebar.markdown("---")
+
 runs_df = fetch_production_runs()
 
 if runs_df.empty:
@@ -289,13 +438,23 @@ st.caption(
     "sustainability analytics for 5-axis CNC machining of Ti-6Al-4V components."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Live Sensor Monitoring",
-    "AI Defect Predictions",
-    "Sustainability Metrics",
-    "Experiment Comparison",
-])
+# ── ROLE-BASED TAB RENDERING ─────────────────────────────────────────
+user_role = st.session_state.get("user_role", "operator")
 
+if user_role == "manager":
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Live Sensor Monitoring",
+        "AI Defect Predictions",
+        "Sustainability Metrics",
+        "Experiment Comparison",
+    ])
+else:
+    tab1, tab2 = st.tabs([
+        "Live Sensor Monitoring",
+        "AI Defect Predictions",
+    ])
+    tab3 = None
+    tab4 = None
 
 # =====================================================================
 # TAB 1: LIVE SENSOR MONITORING
@@ -373,6 +532,37 @@ with tab1:
                 f"Maximum tool wear: {max_wear:.3f}mm (within normal range)."
             )
 
+        # ── Defective Part Summary ────────────────────────────────────
+        cutting_df = sensor_df[sensor_df["machine_state"] == "machining"].copy()
+        if selected_run["defective_parts"] > 0 and not cutting_df.empty:
+            defective_parts = (
+                cutting_df.groupby("part_number")["defect_probability"]
+                .max()
+                .reset_index()
+            )
+            defective_parts = defective_parts[
+                defective_parts["defect_probability"] >= 0.5
+            ]
+            if not defective_parts.empty:
+                part_list = ", ".join([
+                    f"Part {int(p)}" for p in defective_parts["part_number"]
+                ])
+                st.error(
+                    f"**Defective Parts Identified: {part_list}** — "
+                    f"Flag these for rework or scrapping before next operation."
+                )
+                # Show which parts passed
+                all_part_nums = set(cutting_df["part_number"].unique())
+                defective_nums = set(defective_parts["part_number"].tolist())
+                passed_nums = all_part_nums - defective_nums
+                if passed_nums:
+                    passed_list = ", ".join([
+                        f"Part {int(p)}" for p in sorted(passed_nums)
+                    ])
+                    st.success(
+                        f"**Parts Passed: {passed_list}** — "
+                        f"Cleared for next stage."
+                    )
         st.markdown("---")
 
         # ── Operation Defect Analysis ─────────────────────────────────
@@ -602,11 +792,120 @@ with tab1:
 # =====================================================================
  
 with tab2:
-    st.header("AI Visual Inspection")
+    st.header("AI Defect Detection")
     st.caption(
-        "YOLOv11s-OBB visual defect detection results from CMM inspection checkpoints. "
-        "The model detects 22 types of aircraft structural defects using oriented bounding boxes."
+        "Dual-modality defect detection: Random Forest parameter analysis "
+        "and YOLOv11s-OBB visual inspection at each CMM checkpoint."
     )
+
+    # ── RF PARAMETER-BASED PREDICTIONS ───────────────────────────
+    st.subheader("Random Forest Parameter Analysis")
+    st.caption(
+        "RF classifier predicts defect probability from 16 production "
+        "parameters derived from simulation state at the end of each part."
+    )
+
+    rf_df = fetch_defect_predictions(selected_run_id)
+
+    if rf_df.empty:
+        st.info(
+            "No RF predictions for this run. "
+            "Ensure rf_defect_model.pkl is in the project directory "
+            "and re-run the simulation."
+        )
+    else:
+        # KPI row
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Parts Analysed", len(rf_df))
+        with col2:
+            flagged = len(rf_df[rf_df["predicted_class"] == 1])
+            st.metric("Defects Predicted", flagged)
+        with col3:
+            max_prob = rf_df["defect_probability"].max()
+            st.metric("Peak Defect Probability", f"{max_prob:.1%}")
+        with col4:
+            avg_prob = rf_df["defect_probability"].mean()
+            st.metric("Avg Defect Probability", f"{avg_prob:.1%}")
+
+        st.markdown("---")
+
+        # Per-part RF results
+        for idx, row in rf_df.iterrows():
+            part_label = f"Part {idx + 1}"
+            prob = row["defect_probability"]
+            alert = row["alert_level"]
+            pred = row["predicted_class"]
+
+            color = (
+                "red" if alert == "critical"
+                else "orange" if alert == "warning"
+                else "green"
+            )
+            status_str = "DEFECT PREDICTED" if pred == 1 else "CLEAN"
+
+            with st.expander(
+                f"{part_label} — :{color}[{status_str}] | "
+                f"P(defect) = {prob:.1%} | Alert: {alert.upper()}",
+                expanded=(alert in ["critical", "warning"])
+            ):
+                col_a, col_b = st.columns(2)
+
+                with col_a:
+                    # Defect probability gauge
+                    fig_gauge = go.Figure(go.Indicator(
+                        mode="gauge+number",
+                        value=prob * 100,
+                        title={"text": "Defect Probability (%)"},
+                        gauge={
+                            "axis": {"range": [0, 100]},
+                            "bar": {"color": (
+                                "#ef4444" if prob >= 0.70
+                                else "#f59e0b" if prob >= 0.40
+                                else "#10b981"
+                            )},
+                            "steps": [
+                                {"range": [0, 40], "color": "rgba(16,185,129,0.1)"},
+                                {"range": [40, 70], "color": "rgba(245,158,11,0.1)"},
+                                {"range": [70, 100], "color": "rgba(239,68,68,0.1)"},
+                            ],
+                            "threshold": {
+                                "line": {"color": "red", "width": 2},
+                                "thickness": 0.75,
+                                "value": 70,
+                            },
+                        },
+                        number={"suffix": "%", "valueformat": ".1f"},
+                    ))
+                    fig_gauge.update_layout(height=250, margin=dict(t=30, b=0))
+                    st.plotly_chart(fig_gauge, use_container_width=True)
+
+                with col_b:
+                    st.markdown(f"**Predicted Class:** {'Defective' if pred == 1 else 'Non-Defective'}")
+                    st.markdown(f"**Alert Level:** :{color}[{alert.upper()}]")
+                    st.markdown(f"**Recommended Action:**")
+                    st.info(row.get("recommended_action", "N/A"))
+
+                    # Show feature vector if stored
+                    if row.get("feature_importances"):
+                        try:
+                            features = json.loads(row["feature_importances"])
+                            feat_df = pd.DataFrame(
+                                features.items(),
+                                columns=["Feature", "Value"]
+                            )
+                            feat_df["Value"] = feat_df["Value"].round(4)
+                            with st.expander("View Feature Vector"):
+                                st.dataframe(
+                                    feat_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                        except Exception:
+                            pass
+
+    st.markdown("---")
+    st.subheader("YOLOv11s-OBB Visual Inspection")
  
     # ── Section 1: Inspection Results from Simulation ─────────────
     st.subheader("Simulation Inspection Results")
@@ -830,451 +1129,451 @@ with tab2:
 # =====================================================================
 # TAB 3: SUSTAINABILITY METRICS
 # =====================================================================
+if tab3 is not None:
+    with tab3:
+        st.header("Sustainability Metrics")
+        st.caption(
+            "Energy consumption, carbon emissions, and material utilisation analytics. "
+            "Aligned with Safran's NetZero objectives and UK grid carbon intensity (0.233 kg CO₂/kWh)."
+        )
 
-with tab3:
-    st.header("Sustainability Metrics")
-    st.caption(
-        "Energy consumption, carbon emissions, and material utilisation analytics. "
-        "Aligned with Safran's NetZero objectives and UK grid carbon intensity (0.233 kg CO₂/kWh)."
-    )
+        metrics_df = fetch_sustainability_metrics(selected_run_id)
 
-    metrics_df = fetch_sustainability_metrics(selected_run_id)
+        if metrics_df.empty:
+            st.warning("No sustainability data for this run.")
+        else:
+            m = metrics_df.iloc[0]
 
-    if metrics_df.empty:
-        st.warning("No sustainability data for this run.")
-    else:
-        m = metrics_df.iloc[0]
+            # ── KPI Row ──────────────────────────────────────────────────
+            col1, col2, col3, col4 = st.columns(4)
 
-        # ── KPI Row ──────────────────────────────────────────────────
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric(
-                "Total Energy",
-                f"{m['energy_kwh_total']:.1f} kWh",
-                help="Total electrical energy consumed across all operations",
-            )
-
-        with col2:
-            target_co2 = 15.0  # Hypothetical Safran target
-            delta = m["co2_kg_per_part"] - target_co2
-            st.metric(
-                "CO₂ per Part",
-                f"{m['co2_kg_per_part']:.2f} kg",
-                delta=f"{delta:+.2f} vs target",
-                delta_color="inverse",
-                help=f"Target: {target_co2} kg CO₂/part",
-            )
-
-        with col3:
-            st.metric(
-                "Material Utilisation",
-                f"{m['material_utilisation_pct']:.1f}%",
-                help="Percentage of raw material that becomes the final part",
-            )
-
-        with col4:
-            st.metric(
-                "Coolant Used",
-                f"{m['coolant_litres_used']:.0f} L"
-                if pd.notna(m.get("coolant_litres_used")) else "N/A",
-                help="Total cutting fluid consumption",
-            )
-
-        st.markdown("---")
-
-        # ── Energy breakdown chart ────────────────────────────────────
-        st.subheader("Energy Consumption by Operation")
-
-        sensor_df = fetch_sensor_readings(selected_run_id)
-        if not sensor_df.empty:
-            energy_by_op = (
-                sensor_df.groupby("operation")["power_kw"]
-                .sum()
-                .reset_index()
-            )
-            # Convert power readings (1 per minute) to kWh
-            energy_by_op["energy_kwh"] = energy_by_op["power_kw"] / 60
-            energy_by_op = energy_by_op.sort_values("energy_kwh", ascending=False)
-
-            col_left, col_right = st.columns([2, 1])
-
-            with col_left:
-                fig_energy = px.bar(
-                    energy_by_op,
-                    x="operation",
-                    y="energy_kwh",
-                    title="Energy Consumption per Operation",
-                    labels={
-                        "operation": "Operation",
-                        "energy_kwh": "Energy (kWh)",
-                    },
-                    color="energy_kwh",
-                    color_continuous_scale="Reds",
-                )
-                fig_energy.update_layout(height=400, showlegend=False)
-                st.plotly_chart(fig_energy, use_container_width=True)
-
-            with col_right:
-                st.markdown("**Operation Breakdown**")
-                energy_by_op["CO2 (kg)"] = (
-                    energy_by_op["energy_kwh"] * 0.233
-                ).round(3)
-                energy_by_op["energy_kwh"] = energy_by_op["energy_kwh"].round(2)
-                energy_by_op.columns = ["Operation", "Power Sum", "Energy (kWh)", "CO₂ (kg)"]
-                st.dataframe(
-                    energy_by_op[["Operation", "Energy (kWh)", "CO₂ (kg)"]],
-                    use_container_width=True,
-                    hide_index=True,
+            with col1:
+                st.metric(
+                    "Total Energy",
+                    f"{m['energy_kwh_total']:.1f} kWh",
+                    help="Total electrical energy consumed across all operations",
                 )
 
-        st.markdown("---")
+            with col2:
+                target_co2 = 15.0  # Hypothetical Safran target
+                delta = m["co2_kg_per_part"] - target_co2
+                st.metric(
+                    "CO₂ per Part",
+                    f"{m['co2_kg_per_part']:.2f} kg",
+                    delta=f"{delta:+.2f} vs target",
+                    delta_color="inverse",
+                    help=f"Target: {target_co2} kg CO₂/part",
+                )
 
-        # ── Material utilisation visualisation ───────────────────────
-        st.subheader("Material Utilisation")
+            with col3:
+                st.metric(
+                    "Material Utilisation",
+                    f"{m['material_utilisation_pct']:.1f}%",
+                    help="Percentage of raw material that becomes the final part",
+                )
 
-        col_a, col_b = st.columns(2)
+            with col4:
+                st.metric(
+                    "Coolant Used",
+                    f"{m['coolant_litres_used']:.0f} L"
+                    if pd.notna(m.get("coolant_litres_used")) else "N/A",
+                    help="Total cutting fluid consumption",
+                )
 
-        with col_a:
-            # Donut chart: useful product vs scrap
-            useful_pct = m["material_utilisation_pct"]
-            scrap_pct = 100 - useful_pct
+            st.markdown("---")
 
-            fig_donut = go.Figure(data=[go.Pie(
-                labels=["Final Product", "Chips / Scrap"],
-                values=[useful_pct, scrap_pct],
-                hole=0.5,
-                marker=dict(colors=["#10b981", "#94a3b8"]),
-            )])
-            fig_donut.update_layout(
-                title="Material Utilisation Ratio",
-                height=350,
-                annotations=[dict(
-                    text=f"{useful_pct:.1f}%",
-                    x=0.5, y=0.5,
-                    font_size=24,
-                    showarrow=False,
-                )],
-            )
-            st.plotly_chart(fig_donut, use_container_width=True)
+            # ── Energy breakdown chart ────────────────────────────────────
+            st.subheader("Energy Consumption by Operation")
 
-        with col_b:
-            st.markdown("**Material Flow Analysis**")
-            st.markdown(f"""
-            - **Raw material per billet:** 12.5 kg Ti-6Al-4V
-            - **Final part weight:** 4.2 kg
-            - **Material removed (chips):** 8.3 kg per part
-            - **Total scrap this run:** {m['scrap_weight_kg']:.1f} kg
-            - **Chip-to-part ratio:** {m['chip_to_part_ratio']:.2f}
+            sensor_df = fetch_sensor_readings(selected_run_id)
+            if not sensor_df.empty:
+                energy_by_op = (
+                    sensor_df.groupby("operation")["power_kw"]
+                    .sum()
+                    .reset_index()
+                )
+                # Convert power readings (1 per minute) to kWh
+                energy_by_op["energy_kwh"] = energy_by_op["power_kw"] / 60
+                energy_by_op = energy_by_op.sort_values("energy_kwh", ascending=False)
 
-            *Ti-6Al-4V costs approximately £35/kg. Reducing scrap directly
-            translates to material cost savings and lower carbon footprint
-            from primary titanium production.*
-            """)
+                col_left, col_right = st.columns([2, 1])
 
-        st.markdown("---")
+                with col_left:
+                    fig_energy = px.bar(
+                        energy_by_op,
+                        x="operation",
+                        y="energy_kwh",
+                        title="Energy Consumption per Operation",
+                        labels={
+                            "operation": "Operation",
+                            "energy_kwh": "Energy (kWh)",
+                        },
+                        color="energy_kwh",
+                        color_continuous_scale="Reds",
+                    )
+                    fig_energy.update_layout(height=400, showlegend=False)
+                    st.plotly_chart(fig_energy, use_container_width=True)
 
-        # ── CO2 contextualisation ────────────────────────────────────
-        st.subheader("Carbon Footprint Context")
+                with col_right:
+                    st.markdown("**Operation Breakdown**")
+                    energy_by_op["CO2 (kg)"] = (
+                        energy_by_op["energy_kwh"] * 0.233
+                    ).round(3)
+                    energy_by_op["energy_kwh"] = energy_by_op["energy_kwh"].round(2)
+                    energy_by_op.columns = ["Operation", "Power Sum", "Energy (kWh)", "CO₂ (kg)"]
+                    st.dataframe(
+                        energy_by_op[["Operation", "Energy (kWh)", "CO₂ (kg)"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-        co2_per_part = m["co2_kg_per_part"]
-        co2_total = m["energy_kwh_total"] * 0.233
+            st.markdown("---")
 
-        col_c1, col_c2, col_c3 = st.columns(3)
+            # ── Material utilisation visualisation ───────────────────────
+            st.subheader("Material Utilisation")
 
-        with col_c1:
-            st.metric(
-                "Total CO₂ This Run",
-                f"{co2_total:.2f} kg",
-            )
-        with col_c2:
-            # Equivalent in km driven by average car (0.12 kg CO2/km)
-            km_equivalent = co2_total / 0.12
-            st.metric(
-                "Equivalent Car Travel",
-                f"{km_equivalent:.0f} km",
-                help="Based on average UK car emissions of 0.12 kg CO₂/km",
-            )
-        with col_c3:
-            # Equivalent in trees needed to absorb (21 kg CO2/year per tree)
-            trees = co2_total / 21
-            st.metric(
-                "Trees Needed (1 year)",
-                f"{trees:.1f}",
-                help="A mature tree absorbs ~21 kg CO₂ per year",
-            )
+            col_a, col_b = st.columns(2)
 
-        st.markdown("---")
+            with col_a:
+                # Donut chart: useful product vs scrap
+                useful_pct = m["material_utilisation_pct"]
+                scrap_pct = 100 - useful_pct
 
-        st.subheader("CO₂ Emissions per Part")
-        all_runs_metrics_df = fetch_all_runs_with_metrics()
+                fig_donut = go.Figure(data=[go.Pie(
+                    labels=["Final Product", "Chips / Scrap"],
+                    values=[useful_pct, scrap_pct],
+                    hole=0.5,
+                    marker=dict(colors=["#10b981", "#94a3b8"]),
+                )])
+                fig_donut.update_layout(
+                    title="Material Utilisation Ratio",
+                    height=350,
+                    annotations=[dict(
+                        text=f"{useful_pct:.1f}%",
+                        x=0.5, y=0.5,
+                        font_size=24,
+                        showarrow=False,
+                    )],
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
 
-        if not all_runs_metrics_df.empty:
-            co2_df = all_runs_metrics_df.copy()
-            co2_df["start_time"] = pd.to_datetime(co2_df["start_time"])
-            co2_df = co2_df.sort_values("start_time", ascending=True)
-            co2_df["run_label"] = [
-                f"Run {idx + 1}" for idx in range(len(co2_df))
-            ]
+            with col_b:
+                st.markdown("**Material Flow Analysis**")
+                st.markdown(f"""
+                - **Raw material per billet:** 12.5 kg Ti-6Al-4V
+                - **Final part weight:** 4.2 kg
+                - **Material removed (chips):** 8.3 kg per part
+                - **Total scrap this run:** {m['scrap_weight_kg']:.1f} kg
+                - **Chip-to-part ratio:** {m['chip_to_part_ratio']:.2f}
 
-            selected_mask = co2_df["id"] == selected_run_id
-            bar_colors = [
-                "#dc2626" if is_selected else "#fca5a5"
-                for is_selected in selected_mask
-            ]
+                *Ti-6Al-4V costs approximately £35/kg. Reducing scrap directly
+                translates to material cost savings and lower carbon footprint
+                from primary titanium production.*
+                """)
 
-            fig_co2 = go.Figure()
-            fig_co2.add_trace(go.Bar(
-                x=co2_df["run_label"],
-                y=co2_df["co2_kg_per_part"],
-                marker_color=bar_colors,
-                customdata=co2_df[["tool_change_threshold", "yield_pct"]],
-                text=co2_df["co2_kg_per_part"].round(2),
-                textposition="outside",
-                hovertemplate=(
-                    "Run: %{x}<br>"
-                    "CO₂ per Part: %{y:.2f} kg<br>"
-                    "Tool Change Threshold: %{customdata[0]} mm<br>"
-                    "Yield: %{customdata[1]:.1f}%<extra></extra>"
-                ),
-                name="CO₂ per Part",
-            ))
-            fig_co2.add_hline(
-                y=target_co2,
-                line_dash="dash",
-                line_color="orange",
-                annotation_text="Target",
-                annotation_position="right",
-            )
-            fig_co2.update_layout(
-                height=400,
-                margin=dict(l=20, r=20, t=20, b=20),
-                xaxis_title="Production Run",
-                yaxis_title="CO₂ per Part (kg)",
-                showlegend=False,
-            )
-            st.plotly_chart(fig_co2, use_container_width=True)
-        else:
-            st.info("CO₂ comparison will appear once completed runs are available.")
+            st.markdown("---")
 
-        st.markdown("---")
+            # ── CO2 contextualisation ────────────────────────────────────
+            st.subheader("Carbon Footprint Context")
 
-        st.subheader("Sustainability Insights")
-        insight_cols = st.columns(3)
+            co2_per_part = m["co2_kg_per_part"]
+            co2_total = m["energy_kwh_total"] * 0.233
 
-        energy_saving = m["energy_kwh_per_part"] * 0.08
-        if co2_per_part > target_co2:
-            co2_message = (
-                f"Current emissions are {co2_per_part:.2f} kg CO₂/part. "
-                f"Achieving the {target_co2:.0f} kg target requires a "
-                f"{((co2_per_part - target_co2) / co2_per_part) * 100:.0f}% reduction."
-            )
-        else:
-            co2_message = (
-                f"Current emissions are {co2_per_part:.2f} kg CO₂/part, which is "
-                f"{((target_co2 - co2_per_part) / target_co2) * 100:.0f}% below the "
-                f"{target_co2:.0f} kg target."
-            )
+            col_c1, col_c2, col_c3 = st.columns(3)
 
-        with insight_cols[0]:
-            st.markdown("**Energy Reduction Opportunity**")
-            st.write(
-                "Reducing rough milling spindle RPM by 10% could save "
-                f"approximately 8% energy per part ({energy_saving:.1f} kWh) "
-                "with minimal cycle time impact."
-            )
+            with col_c1:
+                st.metric(
+                    "Total CO₂ This Run",
+                    f"{co2_total:.2f} kg",
+                )
+            with col_c2:
+                # Equivalent in km driven by average car (0.12 kg CO2/km)
+                km_equivalent = co2_total / 0.12
+                st.metric(
+                    "Equivalent Car Travel",
+                    f"{km_equivalent:.0f} km",
+                    help="Based on average UK car emissions of 0.12 kg CO₂/km",
+                )
+            with col_c3:
+                # Equivalent in trees needed to absorb (21 kg CO2/year per tree)
+                trees = co2_total / 21
+                st.metric(
+                    "Trees Needed (1 year)",
+                    f"{trees:.1f}",
+                    help="A mature tree absorbs ~21 kg CO₂ per year",
+                )
 
-        with insight_cols[1]:
-            st.markdown("**Material Utilisation**")
-            st.write(
-                f"At {m['material_utilisation_pct']:.1f}%, this run produced "
-                f"{m['scrap_weight_kg']:.1f} kg of scrap. Optimising tool "
-                "change timing could reduce defective parts and improve utilisation."
-            )
+            st.markdown("---")
 
-        with insight_cols[2]:
-            st.markdown("**Carbon Footprint**")
-            st.write(co2_message)
+            st.subheader("CO₂ Emissions per Part")
+            all_runs_metrics_df = fetch_all_runs_with_metrics()
+
+            if not all_runs_metrics_df.empty:
+                co2_df = all_runs_metrics_df.copy()
+                co2_df["start_time"] = pd.to_datetime(co2_df["start_time"])
+                co2_df = co2_df.sort_values("start_time", ascending=True)
+                co2_df["run_label"] = [
+                    f"Run {idx + 1}" for idx in range(len(co2_df))
+                ]
+
+                selected_mask = co2_df["id"] == selected_run_id
+                bar_colors = [
+                    "#dc2626" if is_selected else "#fca5a5"
+                    for is_selected in selected_mask
+                ]
+
+                fig_co2 = go.Figure()
+                fig_co2.add_trace(go.Bar(
+                    x=co2_df["run_label"],
+                    y=co2_df["co2_kg_per_part"],
+                    marker_color=bar_colors,
+                    customdata=co2_df[["tool_change_threshold", "yield_pct"]],
+                    text=co2_df["co2_kg_per_part"].round(2),
+                    textposition="outside",
+                    hovertemplate=(
+                        "Run: %{x}<br>"
+                        "CO₂ per Part: %{y:.2f} kg<br>"
+                        "Tool Change Threshold: %{customdata[0]} mm<br>"
+                        "Yield: %{customdata[1]:.1f}%<extra></extra>"
+                    ),
+                    name="CO₂ per Part",
+                ))
+                fig_co2.add_hline(
+                    y=target_co2,
+                    line_dash="dash",
+                    line_color="orange",
+                    annotation_text="Target",
+                    annotation_position="right",
+                )
+                fig_co2.update_layout(
+                    height=400,
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    xaxis_title="Production Run",
+                    yaxis_title="CO₂ per Part (kg)",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_co2, use_container_width=True)
+            else:
+                st.info("CO₂ comparison will appear once completed runs are available.")
+
+            st.markdown("---")
+
+            st.subheader("Sustainability Insights")
+            insight_cols = st.columns(3)
+
+            energy_saving = m["energy_kwh_per_part"] * 0.08
+            if co2_per_part > target_co2:
+                co2_message = (
+                    f"Current emissions are {co2_per_part:.2f} kg CO₂/part. "
+                    f"Achieving the {target_co2:.0f} kg target requires a "
+                    f"{((co2_per_part - target_co2) / co2_per_part) * 100:.0f}% reduction."
+                )
+            else:
+                co2_message = (
+                    f"Current emissions are {co2_per_part:.2f} kg CO₂/part, which is "
+                    f"{((target_co2 - co2_per_part) / target_co2) * 100:.0f}% below the "
+                    f"{target_co2:.0f} kg target."
+                )
+
+            with insight_cols[0]:
+                st.markdown("**Energy Reduction Opportunity**")
+                st.write(
+                    "Reducing rough milling spindle RPM by 10% could save "
+                    f"approximately 8% energy per part ({energy_saving:.1f} kWh) "
+                    "with minimal cycle time impact."
+                )
+
+            with insight_cols[1]:
+                st.markdown("**Material Utilisation**")
+                st.write(
+                    f"At {m['material_utilisation_pct']:.1f}%, this run produced "
+                    f"{m['scrap_weight_kg']:.1f} kg of scrap. Optimising tool "
+                    "change timing could reduce defective parts and improve utilisation."
+                )
+
+            with insight_cols[2]:
+                st.markdown("**Carbon Footprint**")
+                st.write(co2_message)
 
 
 # =====================================================================
 # TAB 4: EXPERIMENT COMPARISON
 # =====================================================================
-
-with tab4:
-    st.header("Experiment Comparison")
-    st.caption(
-        "Compare production runs across different parameter configurations to identify "
-        "optimal manufacturing strategies. Use this to find the best balance between "
-        "quality (yield), productivity, and sustainability."
-    )
-
-    all_runs = fetch_all_runs_with_metrics()
-
-    if all_runs.empty:
-        st.warning("No completed runs with sustainability data available.")
-    else:
-        st.subheader("Cross-Run Parameter Analysis")
+if tab4 is not None:
+    with tab4:
+        st.header("Experiment Comparison")
         st.caption(
-            "Compare production runs to identify optimal parameter combinations "
-            "for quality, productivity, and sustainability."
+            "Compare production runs across different parameter configurations to identify "
+            "optimal manufacturing strategies. Use this to find the best balance between "
+            "quality (yield), productivity, and sustainability."
         )
 
-        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-        summary_col1.metric("Total Runs", f"{len(all_runs)}")
-        summary_col2.metric("Avg Yield", f"{all_runs['yield_pct'].mean():.1f}%")
-        summary_col3.metric("Best Yield", f"{all_runs['yield_pct'].max():.1f}%")
-        summary_col4.metric(
-            "Avg Energy/Part",
-            f"{all_runs['energy_kwh_per_part'].mean():.1f} kWh",
-        )
+        all_runs = fetch_all_runs_with_metrics()
 
-        st.markdown("---")
+        if all_runs.empty:
+            st.warning("No completed runs with sustainability data available.")
+        else:
+            st.subheader("Cross-Run Parameter Analysis")
+            st.caption(
+                "Compare production runs to identify optimal parameter combinations "
+                "for quality, productivity, and sustainability."
+            )
 
-        st.subheader("Full Run Comparison")
-        st.dataframe(
-            build_full_run_comparison(all_runs),
-            use_container_width=True,
-            hide_index=True,
-        )
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+            summary_col1.metric("Total Runs", f"{len(all_runs)}")
+            summary_col2.metric("Avg Yield", f"{all_runs['yield_pct'].mean():.1f}%")
+            summary_col3.metric("Best Yield", f"{all_runs['yield_pct'].max():.1f}%")
+            summary_col4.metric(
+                "Avg Energy/Part",
+                f"{all_runs['energy_kwh_per_part'].mean():.1f} kWh",
+            )
 
-        st.markdown("---")
+            st.markdown("---")
 
-    if not all_runs.empty and len(all_runs) == 1:
-        st.info(
-            f"Only 1 production run found in the database. "
-            f"Run more simulations with different parameters "
-            f"(e.g., change `tool_change_threshold_vb` in config.py to 0.20, 0.25, etc.) "
-            f"to enable comparison analysis."
-        )
+            st.subheader("Full Run Comparison")
+            st.dataframe(
+                build_full_run_comparison(all_runs),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        st.markdown("### Current Run Summary")
-        run = all_runs.iloc[0]
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Threshold", f"{run.get('tool_change_threshold', 'N/A')} mm")
-        col2.metric("Yield", f"{run['yield_pct']:.1f}%")
-        col3.metric("Energy/Part", f"{run['energy_kwh_per_part']:.1f} kWh")
-        col4.metric("CO₂/Part", f"{run['co2_kg_per_part']:.2f} kg")
-    elif not all_runs.empty:
-        # ── Summary table of all runs ────────────────────────────────
-        st.subheader("All Production Runs")
+            st.markdown("---")
 
-        display_df = all_runs[[
-            "start_time", "tool_change_threshold", "total_parts",
-            "defective_parts", "yield_pct", "energy_kwh_per_part",
-            "co2_kg_per_part", "material_utilisation_pct",
-        ]].copy()
+        if not all_runs.empty and len(all_runs) == 1:
+            st.info(
+                f"Only 1 production run found in the database. "
+                f"Run more simulations with different parameters "
+                f"(e.g., change `tool_change_threshold_vb` in config.py to 0.20, 0.25, etc.) "
+                f"to enable comparison analysis."
+            )
 
-        display_df["start_time"] = pd.to_datetime(
-            display_df["start_time"]
-        ).dt.strftime("%Y-%m-%d %H:%M")
-        display_df.columns = [
-            "Date", "Threshold (mm)", "Parts", "Defective",
-            "Yield (%)", "kWh/Part", "CO₂/Part (kg)", "Material Util (%)"
-        ]
+            st.markdown("### Current Run Summary")
+            run = all_runs.iloc[0]
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Threshold", f"{run.get('tool_change_threshold', 'N/A')} mm")
+            col2.metric("Yield", f"{run['yield_pct']:.1f}%")
+            col3.metric("Energy/Part", f"{run['energy_kwh_per_part']:.1f} kWh")
+            col4.metric("CO₂/Part", f"{run['co2_kg_per_part']:.2f} kg")
+        elif not all_runs.empty:
+            # ── Summary table of all runs ────────────────────────────────
+            st.subheader("All Production Runs")
 
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+            display_df = all_runs[[
+                "start_time", "tool_change_threshold", "total_parts",
+                "defective_parts", "yield_pct", "energy_kwh_per_part",
+                "co2_kg_per_part", "material_utilisation_pct",
+            ]].copy()
 
-        st.markdown("---")
+            display_df["start_time"] = pd.to_datetime(
+                display_df["start_time"]
+            ).dt.strftime("%Y-%m-%d %H:%M")
+            display_df.columns = [
+                "Date", "Threshold (mm)", "Parts", "Defective",
+                "Yield (%)", "kWh/Part", "CO₂/Part (kg)", "Material Util (%)"
+            ]
 
-        # ── Comparison charts ────────────────────────────────────────
-        st.subheader("Parameter Impact Analysis")
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        col_left, col_right = st.columns(2)
+            st.markdown("---")
 
-        with col_left:
-            # Yield vs threshold
-            fig_yield = px.scatter(
+            # ── Comparison charts ────────────────────────────────────────
+            st.subheader("Parameter Impact Analysis")
+
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                # Yield vs threshold
+                fig_yield = px.scatter(
+                    all_runs,
+                    x="tool_change_threshold",
+                    y="yield_pct",
+                    size="total_parts",
+                    title="First-Pass Yield vs Tool Change Threshold",
+                    labels={
+                        "tool_change_threshold": "Tool Change Threshold (mm)",
+                        "yield_pct": "First-Pass Yield (%)",
+                    },
+                    trendline="ols" if len(all_runs) >= 3 else None,
+                )
+                fig_yield.update_traces(marker=dict(color="#10b981"))
+                fig_yield.update_layout(height=400)
+                st.plotly_chart(fig_yield, use_container_width=True)
+
+            with col_right:
+                # Energy vs threshold
+                fig_energy = px.scatter(
+                    all_runs,
+                    x="tool_change_threshold",
+                    y="energy_kwh_per_part",
+                    size="total_parts",
+                    title="Energy per Part vs Tool Change Threshold",
+                    labels={
+                        "tool_change_threshold": "Tool Change Threshold (mm)",
+                        "energy_kwh_per_part": "Energy per Part (kWh)",
+                    },
+                    trendline="ols" if len(all_runs) >= 3 else None,
+                )
+                fig_energy.update_traces(marker=dict(color="#f59e0b"))
+                fig_energy.update_layout(height=400)
+                st.plotly_chart(fig_energy, use_container_width=True)
+
+            st.markdown("---")
+
+            # ── Pareto front: yield vs CO2 ───────────────────────────────
+            st.subheader("Quality vs Sustainability Trade-off")
+
+            fig_pareto = px.scatter(
                 all_runs,
-                x="tool_change_threshold",
+                x="co2_kg_per_part",
                 y="yield_pct",
                 size="total_parts",
-                title="First-Pass Yield vs Tool Change Threshold",
+                color="tool_change_threshold",
+                hover_data=["tool_change_threshold", "defective_parts"],
+                title="Pareto Front: First-Pass Yield vs CO₂ Emissions",
                 labels={
-                    "tool_change_threshold": "Tool Change Threshold (mm)",
+                    "co2_kg_per_part": "CO₂ per Part (kg)",
                     "yield_pct": "First-Pass Yield (%)",
+                    "tool_change_threshold": "Threshold (mm)",
                 },
-                trendline="ols" if len(all_runs) >= 3 else None,
+                color_continuous_scale="Viridis",
             )
-            fig_yield.update_traces(marker=dict(color="#10b981"))
-            fig_yield.update_layout(height=400)
-            st.plotly_chart(fig_yield, use_container_width=True)
+            fig_pareto.update_layout(height=500)
+            st.plotly_chart(fig_pareto, use_container_width=True)
 
-        with col_right:
-            # Energy vs threshold
-            fig_energy = px.scatter(
-                all_runs,
-                x="tool_change_threshold",
-                y="energy_kwh_per_part",
-                size="total_parts",
-                title="Energy per Part vs Tool Change Threshold",
-                labels={
-                    "tool_change_threshold": "Tool Change Threshold (mm)",
-                    "energy_kwh_per_part": "Energy per Part (kWh)",
-                },
-                trendline="ols" if len(all_runs) >= 3 else None,
+            st.markdown("""
+            **How to read this chart:** Each point is one production run. The
+            ideal configuration is in the **top-left** (high yield, low CO₂).
+            Runs in the bottom-right represent inefficient configurations.
+            Larger circles indicate runs that produced more parts.
+            """)
+
+            st.markdown("---")
+
+            # ── Decision support ────────────────────────────────────────
+            st.subheader("Recommendation")
+
+            best_run = all_runs.loc[all_runs["yield_pct"].idxmax()]
+            worst_run = all_runs.loc[all_runs["yield_pct"].idxmin()]
+
+            scrap_savings = (
+                (worst_run["defective_parts"] - best_run["defective_parts"])
+                * 12.5 * 35  # 12.5 kg titanium at £35/kg
             )
-            fig_energy.update_traces(marker=dict(color="#f59e0b"))
-            fig_energy.update_layout(height=400)
-            st.plotly_chart(fig_energy, use_container_width=True)
 
-        st.markdown("---")
+            st.success(f"""
+            **Recommended configuration:** Tool change threshold of
+            **{best_run['tool_change_threshold']} mm** achieves the highest
+            first-pass yield of **{best_run['yield_pct']:.1f}%**.
 
-        # ── Pareto front: yield vs CO2 ───────────────────────────────
-        st.subheader("Quality vs Sustainability Trade-off")
-
-        fig_pareto = px.scatter(
-            all_runs,
-            x="co2_kg_per_part",
-            y="yield_pct",
-            size="total_parts",
-            color="tool_change_threshold",
-            hover_data=["tool_change_threshold", "defective_parts"],
-            title="Pareto Front: First-Pass Yield vs CO₂ Emissions",
-            labels={
-                "co2_kg_per_part": "CO₂ per Part (kg)",
-                "yield_pct": "First-Pass Yield (%)",
-                "tool_change_threshold": "Threshold (mm)",
-            },
-            color_continuous_scale="Viridis",
-        )
-        fig_pareto.update_layout(height=500)
-        st.plotly_chart(fig_pareto, use_container_width=True)
-
-        st.markdown("""
-        **How to read this chart:** Each point is one production run. The
-        ideal configuration is in the **top-left** (high yield, low CO₂).
-        Runs in the bottom-right represent inefficient configurations.
-        Larger circles indicate runs that produced more parts.
-        """)
-
-        st.markdown("---")
-
-        # ── Decision support ────────────────────────────────────────
-        st.subheader("Recommendation")
-
-        best_run = all_runs.loc[all_runs["yield_pct"].idxmax()]
-        worst_run = all_runs.loc[all_runs["yield_pct"].idxmin()]
-
-        scrap_savings = (
-            (worst_run["defective_parts"] - best_run["defective_parts"])
-            * 12.5 * 35  # 12.5 kg titanium at £35/kg
-        )
-
-        st.success(f"""
-        **Recommended configuration:** Tool change threshold of
-        **{best_run['tool_change_threshold']} mm** achieves the highest
-        first-pass yield of **{best_run['yield_pct']:.1f}%**.
-
-        **Estimated savings vs worst configuration:**
-        - **{worst_run['defective_parts'] - best_run['defective_parts']} fewer defective parts**
-        - **£{scrap_savings:.0f} saved in material costs per shift**
-        - **{(worst_run['co2_kg_per_part'] - best_run['co2_kg_per_part']) * best_run['total_parts']:.1f} kg CO₂ avoided per shift**
-        """)
+            **Estimated savings vs worst configuration:**
+            - **{worst_run['defective_parts'] - best_run['defective_parts']} fewer defective parts**
+            - **£{scrap_savings:.0f} saved in material costs per shift**
+            - **{(worst_run['co2_kg_per_part'] - best_run['co2_kg_per_part']) * best_run['total_parts']:.1f} kg CO₂ avoided per shift**
+            """)
 
 
 # =====================================================================

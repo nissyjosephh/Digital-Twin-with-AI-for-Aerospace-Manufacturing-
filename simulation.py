@@ -30,7 +30,7 @@ from config import (
 )
 from sensors import SensorGenerator
 from supabase_client import DigitalTwinDB
-from ai_model import VisualInspector
+from ai_model import VisualInspector, RFDefectPredictor
 
 class CNCDigitalTwin:
     """
@@ -97,7 +97,7 @@ class CNCDigitalTwin:
             test_images_dir="test_images",
             conf_threshold=0.25,
         )
-
+        self.rf_predictor = RFDefectPredictor(model_path="rf_defect_model.pkl")
     def run(self):
         """
         Execute the complete production simulation.
@@ -215,6 +215,61 @@ class CNCDigitalTwin:
                     "PART_COMPLETE",
                     f"Part {part_num} PASSED quality check"
                 )
+
+            # ── RF PARAMETER-BASED DEFECT PREDICTION ─────────────────
+            # After each part completes, build a feature vector from the
+            # simulation state and run the Random Forest classifier.
+            # This is the parameter-based layer of dual-modality detection.
+            if self.rf_predictor.is_available():
+                # Gather this part's sensor readings for feature construction
+                part_readings = [
+                    r for r in self.sensor_data
+                    if r.get("part_number") == part_num
+                    and r.get("machine_state") == "machining"
+                ]
+
+                if part_readings:
+                    max_defect_prob = max(
+                        r["defect_probability"] for r in part_readings
+                    )
+                    avg_defect_prob = sum(
+                        r["defect_probability"] for r in part_readings
+                    ) / len(part_readings)
+                else:
+                    max_defect_prob = 0.02
+                    avg_defect_prob = 0.02
+
+                # Energy for this part only (difference from previous part)
+                current_energy = self.sensor_gen.cumulative_energy_kwh
+                energy_this_part = current_energy / max(self.parts_produced, 1)
+
+                part_state = {
+                    "part_number": part_num,
+                    "max_defect_probability": max_defect_prob,
+                    "avg_defect_probability": avg_defect_prob,
+                    "sensor_defect_detected": part_defective,
+                    "tool_changes_this_run": self.tool_changes,
+                    "energy_this_part_kwh": energy_this_part,
+                    "operation_minutes": sum(
+                        op["duration_minutes"] for op in OPERATIONS
+                    ),
+                    "tool_wear_final_vb": self.sensor_gen.current_tool_wear_vb,
+                }
+
+                rf_result = self.rf_predictor.predict_from_part_state(part_state)
+
+                if rf_result and self.db_connected:
+                    import json
+                    self.db.store_defect_prediction({
+                        "sensor_reading_id": None,
+                        "defect_probability": rf_result["defect_probability"],
+                        "predicted_class": rf_result["predicted_class"],
+                        "alert_level": rf_result["alert_level"],
+                        "feature_importances": json.dumps(
+                            rf_result["feature_vector"]
+                        ),
+                        "recommended_action": rf_result["recommended_action"],
+                    })
 
             print(f"  Part {part_num}: {'FAIL' if part_defective else 'PASS'}"
                   f" | Tool wear: {self.sensor_gen.current_tool_wear_vb:.3f}mm")

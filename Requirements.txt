@@ -9,3 +9,4 @@ streamlit
 ultralytics
 opencv-python-headless
 Pillow
+joblib

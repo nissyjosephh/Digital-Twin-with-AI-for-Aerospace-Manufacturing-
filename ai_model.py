@@ -318,3 +318,171 @@ class VisualInspector:
             "part_number": part_number,
             "critical_defects_found": [],
         }
+class RFDefectPredictor:
+    """
+    Random Forest parameter-based defect predictor.
+
+    Loads the pre-trained RF classifier and maps simulation state
+    variables onto the 16 training features. Called once per part
+    after all machining operations complete.
+
+    WHY THIS APPROACH (for dissertation):
+    The RF was trained on a manufacturing quality dataset with features
+    like DefectRate, QualityScore and EnergyConsumption. These concepts
+    are present in the simulation but under different names. This class
+    performs the mapping explicitly, making the integration transparent
+    and auditable.
+    """
+
+    # Feature order must match the training dataset column order exactly.
+    # This is the order X = df.drop(['DefectStatus'], axis=1) produced.
+    FEATURE_NAMES = [
+        'ProductionVolume', 'ProductionCost', 'SupplierQuality',
+        'DeliveryDelay', 'DefectRate', 'QualityScore',
+        'MaintenanceHours', 'DowntimePercentage',
+        'InventoryTurnover', 'StockoutRate', 'WorkerProductivity',
+        'SafetyIncidents', 'EnergyConsumption', 'EnergyEfficiency',
+        'AdditiveProcessTime', 'AdditiveMaterialCost'
+    ]
+
+    def __init__(self, model_path="rf_defect_model.pkl"):
+        """
+        Load the trained Random Forest model from disk.
+
+        Args:
+            model_path: Path to the joblib-saved RF model file.
+        """
+        self.model = None
+        self.model_path = model_path
+
+        try:
+            import joblib
+            if os.path.exists(model_path):
+                self.model = joblib.load(model_path)
+                print(f"  RF: Model loaded from {model_path}")
+            else:
+                print(f"  RF: Model file not found at {model_path}")
+                print(f"      Download rf_defect_model.pkl from Kaggle.")
+        except ImportError:
+            print("  RF: joblib not installed. Run: pip install joblib")
+        except Exception as e:
+            print(f"  RF: Failed to load model — {e}")
+
+    def is_available(self):
+        """Check if model loaded successfully."""
+        return self.model is not None
+
+    def predict_from_part_state(self, part_state):
+        """
+        Build a feature vector from simulation state and run RF prediction.
+
+        Maps simulation-generated values onto the 16 features the model
+        was trained on. The mapping is documented inline for transparency.
+
+        Args:
+            part_state: dict containing simulation state for this part.
+                Keys expected:
+                - part_number (int)
+                - max_defect_probability (float)
+                - avg_defect_probability (float)
+                - sensor_defect_detected (bool)
+                - tool_changes_this_run (int)
+                - energy_this_part_kwh (float)
+                - operation_minutes (int)
+                - tool_wear_final_vb (float)
+
+        Returns:
+            dict: Prediction result with probability, class, alert level,
+                  recommended action and the feature vector used.
+        """
+        if not self.is_available():
+            return None
+
+        import numpy as np
+
+        p = part_state
+
+        # ── FEATURE MAPPING ──────────────────────────────────────────
+        # Each line maps a simulation variable to its training feature.
+        # Fixed values represent constants that have no simulation
+        # equivalent (e.g. supplier quality, stockout rate).
+
+        production_volume = float(p.get("part_number", 1))
+        production_cost = (
+            p.get("energy_this_part_kwh", 50.0) * 0.15
+            + p.get("tool_changes_this_run", 0) * 12.5
+        )
+        supplier_quality = 0.87
+        delivery_delay = 0.0
+        defect_rate = p.get("max_defect_probability", 0.02)
+        quality_score = round((1.0 - p.get("avg_defect_probability", 0.02)) * 100, 2)
+        maintenance_hours = p.get("tool_changes_this_run", 0) * (1 / 60)
+        total_minutes = p.get("operation_minutes", 120)
+        downtime_pct = (
+            (p.get("tool_changes_this_run", 0) * 1) / max(total_minutes, 1)
+        ) * 100
+        inventory_turnover = 8.5
+        stockout_rate = 0.0
+        worker_productivity = (p.get("part_number", 1) / max(total_minutes / 60, 0.1))
+        safety_incidents = 0
+        energy_consumption = p.get("energy_this_part_kwh", 50.0)
+        energy_efficiency = round(1.0 - (energy_consumption / 90.0), 4)
+        energy_efficiency = max(0.0, min(1.0, energy_efficiency))
+        additive_process_time = 0.0
+        additive_material_cost = 0.0
+
+        feature_vector = [
+            production_volume, production_cost, supplier_quality,
+            delivery_delay, defect_rate, quality_score,
+            maintenance_hours, downtime_pct, inventory_turnover,
+            stockout_rate, worker_productivity, safety_incidents,
+            energy_consumption, energy_efficiency,
+            additive_process_time, additive_material_cost
+        ]
+
+        X = np.array(feature_vector).reshape(1, -1)
+
+
+        # ── INFERENCE ────────────────────────────────────────────────
+        predicted_class = int(self.model.predict(X)[0])
+        probabilities = self.model.predict_proba(X)[0]
+        defect_probability = round(float(probabilities[1]), 4)
+
+        # Alert level thresholds
+        if defect_probability >= 0.70:
+            alert_level = "critical"
+            recommended_action = (
+                "STOP PRODUCTION: RF model predicts high defect probability. "
+                "Inspect tooling and review last operation parameters immediately."
+            )
+        elif defect_probability >= 0.40:
+            alert_level = "warning"
+            recommended_action = (
+                "MONITOR CLOSELY: Elevated defect risk detected. "
+                "Check tool wear and coolant flow before next part."
+            )
+        else:
+            alert_level = "normal"
+            recommended_action = "Production parameters within acceptable range."
+
+        # Build feature importance dict for storage
+        feature_dict = dict(zip(self.FEATURE_NAMES, feature_vector))
+
+        result = {
+            "part_number": p.get("part_number"),
+            "defect_probability": defect_probability,
+            "predicted_class": predicted_class,
+            "alert_level": alert_level,
+            "recommended_action": recommended_action,
+            "feature_vector": feature_dict,
+        }
+
+        # Console output
+        status = "DEFECT" if predicted_class == 1 else "CLEAN"
+        print(
+            f"  RF:   Part {p.get('part_number')} — {status} | "
+            f"P(defect)={defect_probability:.1%} | "
+            f"Alert: {alert_level.upper()}"
+        )
+
+        return result    
