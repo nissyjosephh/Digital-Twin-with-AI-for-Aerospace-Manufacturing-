@@ -5,7 +5,7 @@ Birmingham City University
 
 Author: Nissy Joseph (22177041)
 Supervisor: Debashish Das
-Industry Partners: Safran - Scott Dickin, Rhys Woodward
+Industry Partners: Safran - Rhys Woodward
 
 ## What This Project Does
 A prototype digital twin of a 5-axis CNC machining process for Ti-6Al-4V
@@ -47,7 +47,7 @@ streamlit run dashboard.py
 Opens in browser at http://localhost:8501
 
 
-
+### 8. Detailed video of the working prototype has been uploaded along with the files
 
 ## Project Structure
 digital-twin-project/
@@ -57,7 +57,7 @@ digital-twin-project/
 ├── supabase_client.py    # Database integration layer
 ├── dashboard.py          # Streamlit visualisation dashboard
 ├── requirements.txt      # Python package dependencies
-├── .env                  # Supabase credentials (not in repo)
+├── .env                  # Supabase credentials 
 ├── .gitignore            # Files excluded from version control
 ├── data/                 # Simulation output CSVs (generated)
 └── venv/                 # Virtual environment (generated)
